@@ -109,6 +109,13 @@ Work proceeds one phase at a time with a hard stop at each gate. Phase reports l
 | 5 | Run the experiment matrix | 35 runs, 0 failures, 87 min | ✅ |
 | 6 | Findings | [`FINDINGS.md`](FINDINGS.md) | ✅ |
 
+**New here?** Start with [`minimal/`](minimal/) — the whole lab as one readable script:
+```bash
+cd minimal && ../.venv/bin/python siamese_minimal.py selftest   # 2 s, no data needed
+../.venv/bin/python siamese_minimal.py explain                  # the ideas, with live numbers
+../.venv/bin/python siamese_minimal.py demo                     # train + evaluate + plot, ~1 min
+```
+
 **Read [`FINDINGS.md`](FINDINGS.md) first** — it answers every poster claim with a figure
 and a number, including the four results that contradicted the plan's predictions.
 Then [`notebooks/siamese_lab_tour.ipynb`](notebooks/siamese_lab_tour.ipynb) to play with
