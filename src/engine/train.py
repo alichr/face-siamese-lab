@@ -31,6 +31,8 @@ from src.data.splits import load_eval_pairs, load_splits
 from src.data.transforms import build_transform
 from src.engine.evaluate import evaluate_pairs
 from src.losses.contrastive import ContrastiveLoss
+from src.losses.infonce import InfoNCELoss
+from src.losses.triplet import TripletLoss
 from src.models.encoder import build_encoder
 
 DEFAULTS: dict[str, Any] = {
@@ -99,14 +101,23 @@ def seed_everything(seed: int) -> None:
 
 
 def build_loss(cfg: dict):
-    """Construct the loss named in the config's `loss` block.
-
-    Phase 1 knows only `contrastive`; Phase 2 registers triplet and infonce here.
-    """
+    """Construct the loss named in the config's `loss` block (plan §6)."""
     name = cfg["name"]
+    seed = cfg.get("seed", 0)
+
     if name == "contrastive":
-        return ContrastiveLoss(margin=cfg.get("margin", 1.0), seed=cfg.get("seed", 0))
-    raise ValueError(f"unknown loss {name!r} (Phase 1 implements only 'contrastive')")
+        return ContrastiveLoss(margin=cfg.get("margin", 1.0), seed=seed)
+    if name == "triplet":
+        return TripletLoss(
+            margin=cfg.get("margin", 0.2), miner=cfg.get("miner", "semi-hard"), seed=seed
+        )
+    if name == "infonce":
+        return InfoNCELoss(
+            temperature=cfg.get("temperature", 0.07),
+            supcon=cfg.get("supcon", False),
+            seed=seed,
+        )
+    raise ValueError(f"unknown loss {name!r}; expected one of contrastive/triplet/infonce")
 
 
 def build_lr_lambda(warmup_epochs: int, total_epochs: int, batches_per_epoch: int):
@@ -293,9 +304,17 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         writer.writerow({k: row.get(k, "") for k in writer.fieldnames})
         curves_file.flush()
 
+        # Print every diagnostic the loss reported. `active_fraction` in
+        # particular is the curve that separates the three miners in E3, so it
+        # must never be filtered out of the console log.
+        diagnostics = " ".join(
+            f"{k} {row[k]:.4f}"
+            for k in row
+            if k not in ("epoch", "lr", "loss", "epoch_seconds", "img_per_s")
+            and not k.startswith("val_")
+        )
         print(
-            f"epoch {epoch:3d} | loss {row['loss']:.4f} | "
-            + " ".join(f"{k} {row[k]:.4f}" for k in row if k.startswith(("mean_", "frac_")))
+            f"epoch {epoch:3d} | loss {row['loss']:.4f} | {diagnostics}"
             + (f" | val_auc {row['val_auc']:.4f}" if "val_auc" in row else "")
             + f" | {epoch_time:.1f}s {row['img_per_s']:.0f} img/s",
             flush=True,
