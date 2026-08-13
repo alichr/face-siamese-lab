@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader
 
@@ -30,6 +32,7 @@ from src.data.pk_sampler import PKSampler
 from src.data.splits import load_eval_pairs, load_splits
 from src.data.transforms import build_transform
 from src.engine.evaluate import evaluate_pairs
+from src.engine.gather import get_rank, get_world_size, global_infonce_inputs, is_distributed
 from src.engine.report import evaluate_run
 from src.losses.contrastive import ContrastiveLoss
 from src.losses.infonce import InfoNCELoss
@@ -53,7 +56,10 @@ DEFAULTS: dict[str, Any] = {
         "normalize": True,
         "pretrained": False,
     },
-    "loss": {"name": "contrastive", "margin": 1.0},
+    # `negatives: local | global` (plan §6c). `global` gathers normalized
+    # embeddings across ranks so the negative pool is the whole DDP batch; it is
+    # only meaningful for InfoNCE under torchrun.
+    "loss": {"name": "contrastive", "margin": 1.0, "negatives": "local"},
     "sampler": {"p": 64, "k": 4, "allow_replacement": False},
     "train": {
         "epochs": 30,
@@ -65,6 +71,7 @@ DEFAULTS: dict[str, Any] = {
         "eval_every": 1,
         "batches_per_epoch": None,
         "full_eval": True,
+        "sync_bn": True,
     },
 }
 
@@ -145,19 +152,31 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
     cfg = load_config(config_path, overrides)
     seed_everything(cfg["seed"])
 
-    out_dir = Path(cfg["output_dir"])
-    (out_dir / "ckpts").mkdir(parents=True, exist_ok=True)
-    (out_dir / "figures").mkdir(parents=True, exist_ok=True)
-    with (out_dir / "config.yaml").open("w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
+    # --- distributed init (no-op unless launched by torchrun) ---------------
+    if "LOCAL_RANK" in os.environ and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    rank, world_size = get_rank(), get_world_size()
+    is_main = rank == 0
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_dir = Path(cfg["output_dir"])
+    if is_main:
+        (out_dir / "ckpts").mkdir(parents=True, exist_ok=True)
+        (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+        with (out_dir / "config.yaml").open("w") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+
+    device = torch.device(
+        f"cuda:{os.environ['LOCAL_RANK']}" if "LOCAL_RANK" in os.environ
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     torch.backends.cudnn.benchmark = True
 
     # --- data ---------------------------------------------------------------
     data_cfg = cfg["data"]
     splits = load_splits(data_cfg["splits_dir"])  # asserts disjointness (plan §14.4)
-    print(splits.summary(), flush=True)
+    if is_main:
+        print(splits.summary(), flush=True)
 
     train_set = CelebAIdentityDataset(
         identities=splits.train,
@@ -165,7 +184,8 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         root=Path(data_cfg["celeba_root"]),
         max_identities=data_cfg["debug_identities"],
     )
-    print(f"train: {train_set.summary()}", flush=True)
+    if is_main:
+        print(f"train: {train_set.summary()}", flush=True)
 
     sampler_cfg = cfg["sampler"]
 
@@ -176,8 +196,12 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
     # 0.85-0.94 LFW expectation (and its ~1-2 h/run estimate, which only makes
     # sense at full-split epochs). The sampler reshuffles identities whenever it
     # exhausts them, so asking for more batches than P-groups is well-defined.
+    # Divide by world_size as well: each rank runs `batches_per_epoch` steps, so
+    # without this a 3-rank epoch would consume 3x the images of a single-GPU
+    # epoch and E5's batch-size comparison would silently also be a
+    # training-budget comparison (plan §10 / Musgrave et al. on fair budgets).
     batches_per_epoch = cfg["train"]["batches_per_epoch"] or max(
-        1, len(train_set) // (sampler_cfg["p"] * sampler_cfg["k"])
+        1, len(train_set) // (sampler_cfg["p"] * sampler_cfg["k"] * world_size)
     )
 
     sampler = PKSampler(
@@ -187,12 +211,16 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         seed=cfg["seed"],
         allow_replacement=sampler_cfg["allow_replacement"],
         num_batches=batches_per_epoch,
+        rank=rank,
+        world_size=world_size,
     )
-    print(
-        f"sampler: P={sampler.p} K={sampler.k} batch={sampler.batch_size} "
-        f"{len(sampler)} batches/epoch, {sampler.n_dropped_identities} ids dropped (<K images)",
-        flush=True,
-    )
+    if is_main:
+        print(
+            f"sampler: P={sampler.p} K={sampler.k} batch={sampler.batch_size}/rank "
+            f"(global {sampler.batch_size * world_size}) {len(sampler)} batches/epoch, "
+            f"{sampler.n_dropped_identities} ids dropped (<K images)",
+            flush=True,
+        )
 
     loader = DataLoader(
         train_set,
@@ -212,13 +240,47 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
             data_cfg["splits_dir"], which=data_cfg["eval_split"]
         )
         eval_tag = data_cfg["eval_split"]
-    print(f"eval on {eval_tag}: {len(eval_pairs):,} pairs", flush=True)
+    if is_main:
+        print(f"eval on {eval_tag}: {len(eval_pairs):,} pairs", flush=True)
 
     # --- model, loss, optimizer ---------------------------------------------
     model = build_encoder(cfg["model"]).to(device)
-    print(model.summary(), flush=True)
+    if is_main:
+        print(model.summary(), flush=True)
+
+    core_model = model  # unwrapped reference for eval and checkpointing
+    if is_distributed():
+        # SyncBN for TRAINING runs: with 256 images per rank, plain BN would
+        # normalize each shard by its own statistics, so the three ranks would
+        # apply different transforms to the same global batch. (The Phase 4 gate
+        # runs in eval mode instead, which freezes BN entirely -- that is a
+        # correctness test, not a training configuration.)
+        if cfg["train"]["sync_bn"]:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[device.index], output_device=device.index
+        )
+        core_model = model.module
+        if is_main:
+            print(
+                f"DDP: world_size={world_size}, sync_bn={cfg['train']['sync_bn']}, "
+                f"negatives={cfg['loss'].get('negatives', 'local')}",
+                flush=True,
+            )
 
     criterion = build_loss({**cfg["loss"], "seed": cfg["seed"]})
+
+    use_global_negatives = (
+        cfg["loss"].get("negatives", "local") == "global"
+        and cfg["loss"]["name"] == "infonce"
+        and is_distributed()
+    )
+    if cfg["loss"].get("negatives") == "global" and not use_global_negatives and is_main:
+        print(
+            "WARNING: negatives=global requested but not active "
+            f"(loss={cfg['loss']['name']}, distributed={is_distributed()}) — using local.",
+            flush=True,
+        )
 
     train_cfg = cfg["train"]
     optimizer = torch.optim.AdamW(
@@ -232,7 +294,7 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
 
     # --- loop ---------------------------------------------------------------
     curves_path = out_dir / "curves.csv"
-    curves_file = curves_path.open("w", newline="")
+    curves_file = curves_path.open("w", newline="") if is_main else open(os.devnull, "w")
     writer: csv.DictWriter | None = None
 
     best_auc, best_epoch = -1.0, -1
@@ -256,13 +318,26 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
                     embeddings = model(images)
                 # Losses run in fp32: the similarity matrix and the log-sum-exp
                 # in InfoNCE lose meaningful precision in bf16 (~3 decimal digits).
-                loss, logs = criterion(embeddings.float(), labels)
+                embeddings = embeddings.float()
             else:
                 embeddings = model(images)
+
+            if use_global_negatives:
+                # Embeddings are already L2-normalized by the encoder; gathering
+                # happens AFTER normalization (plan §6c and the classic-bug list).
+                pool, pool_labels, rank_offset = global_infonce_inputs(embeddings, labels)
+                loss, logs = criterion(
+                    embeddings, labels, pool, pool_labels, rank_offset=rank_offset
+                )
+                # Scale by 1/W so the reduce-scattered gradient sum matches the
+                # single-process (1/N) average -- derived in tests/ddp_equivalence.py.
+                backward_loss = loss / world_size
+            else:
                 loss, logs = criterion(embeddings, labels)
+                backward_loss = loss
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            backward_loss.backward()
             if train_cfg["grad_clip"]:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
             optimizer.step()
@@ -281,9 +356,11 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         row.update({k: v / max(1, n_steps) for k, v in running.items()})
         row["img_per_s"] = len(sampler) * sampler.batch_size / epoch_time
 
-        if (epoch + 1) % train_cfg["eval_every"] == 0 or epoch == train_cfg["epochs"] - 1:
+        if is_main and (
+            (epoch + 1) % train_cfg["eval_every"] == 0 or epoch == train_cfg["epochs"] - 1
+        ):
             last_eval = evaluate_pairs(
-                model,
+                core_model,
                 eval_pairs,
                 eval_labels,
                 device,
@@ -296,15 +373,21 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
             if last_eval["auc"] > best_auc:
                 best_auc, best_epoch = last_eval["auc"], epoch
                 torch.save(
-                    {"model": model.state_dict(), "epoch": epoch, "auc": best_auc, "config": cfg},
+                    {
+                        "model": core_model.state_dict(),
+                        "epoch": epoch,
+                        "auc": best_auc,
+                        "config": cfg,
+                    },
                     out_dir / "ckpts" / "best.pt",
                 )
 
-        if writer is None:
-            writer = csv.DictWriter(curves_file, fieldnames=list(row))
-            writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in writer.fieldnames})
-        curves_file.flush()
+        if is_main:
+            if writer is None:
+                writer = csv.DictWriter(curves_file, fieldnames=list(row))
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in writer.fieldnames})
+            curves_file.flush()
 
         # Print every diagnostic the loss reported. `active_fraction` in
         # particular is the curve that separates the three miners in E3, so it
@@ -315,6 +398,8 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
             if k not in ("epoch", "lr", "loss", "epoch_seconds", "img_per_s")
             and not k.startswith("val_")
         )
+        if not is_main:
+            continue
         print(
             f"epoch {epoch:3d} | loss {row['loss']:.4f} | {diagnostics}"
             + (f" | val_auc {row['val_auc']:.4f}" if "val_auc" in row else "")
@@ -323,8 +408,14 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         )
 
     curves_file.close()
+    if not is_main:
+        # Non-main ranks have nothing to write; wait for rank 0 to finish
+        # evaluating so no process exits and tears down the group early.
+        dist.barrier()
+        return {}
+
     torch.save(
-        {"model": model.state_dict(), "epoch": train_cfg["epochs"] - 1, "config": cfg},
+        {"model": core_model.state_dict(), "epoch": train_cfg["epochs"] - 1, "config": cfg},
         out_dir / "ckpts" / "last.pt",
     )
 
@@ -333,10 +424,10 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
     # and checkpoint selection are both finished.
     best_path = out_dir / "ckpts" / "best.pt"
     if best_path.exists() and train_cfg["full_eval"]:
-        model.load_state_dict(torch.load(best_path, weights_only=False)["model"])
+        core_model.load_state_dict(torch.load(best_path, weights_only=False)["model"])
 
     full_metrics = (
-        evaluate_run(model, cfg, out_dir, device, amp_dtype=amp_dtype)
+        evaluate_run(core_model, cfg, out_dir, device, amp_dtype=amp_dtype)
         if train_cfg["full_eval"]
         else {}
     )
@@ -353,6 +444,9 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
             len(sampler) * sampler.batch_size / np.median(epoch_times)
         ),
         "batch_size": sampler.batch_size,
+        "global_batch_size": sampler.batch_size * world_size,
+        "world_size": world_size,
+        "negatives": cfg["loss"].get("negatives", "local"),
         "batches_per_epoch": len(sampler),
         "train_images": len(train_set),
         "train_identities": train_set.n_identities,
@@ -361,6 +455,8 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         json.dump(metrics, f, indent=2)
 
     print(json.dumps(metrics, indent=2), flush=True)
+    if is_distributed():
+        dist.barrier()
     return metrics
 
 

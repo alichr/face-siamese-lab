@@ -20,6 +20,7 @@ include = ["src*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+markers = ["slow: launches subprocesses / multi-GPU jobs"]
 
 [tool.ruff]
 line-length = 100

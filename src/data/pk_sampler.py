@@ -55,6 +55,8 @@ class PKSampler(Sampler[list[int]]):
         seed: int = 0,
         allow_replacement: bool = False,
         num_batches: int | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         """
         Args:
@@ -66,6 +68,15 @@ class PKSampler(Sampler[list[int]]):
                 images with replacement instead of dropping them.
             num_batches: batches per epoch. Default `n_identities // p`, i.e. one
                 pass in which each usable identity appears exactly once.
+            rank: this process's rank under DDP.
+            world_size: number of DDP processes. When > 1, every rank draws from
+                the SAME seeded identity permutation but takes a different slice
+                of it, so the P identities on rank 0 are disjoint from those on
+                ranks 1 and 2 within the same step. That disjointness is what
+                makes global negatives mean what E5 claims: with independent
+                per-rank shuffles, the same identity could land on two ranks and
+                some of the "extra negatives" gained by gathering would actually
+                be positives.
 
         Raises:
             ValueError: if p or k < 1, k < 2 (no positives possible), or fewer
@@ -81,6 +92,8 @@ class PKSampler(Sampler[list[int]]):
         self.p = p
         self.k = k
         self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
         self.allow_replacement = allow_replacement
         self._epoch = 0
 
@@ -109,9 +122,17 @@ class PKSampler(Sampler[list[int]]):
 
         self.n_identities = len(self._identities)
         self.batch_size = p * k
+        # Each step consumes P identities per rank, so a full pass over
+        # identities yields correspondingly fewer steps under DDP.
         self._num_batches = (
-            self.n_identities // p if num_batches is None else int(num_batches)
+            self.n_identities // (p * world_size) if num_batches is None else int(num_batches)
         )
+
+        if self.n_identities < p * world_size:
+            raise ValueError(
+                f"{self.n_identities} usable identities cannot fill p={p} x "
+                f"world_size={world_size} = {p * world_size} disjoint slots per step"
+            )
 
     def set_epoch(self, epoch: int) -> None:
         """Reseed the shuffle for `epoch`.
@@ -135,23 +156,30 @@ class PKSampler(Sampler[list[int]]):
         the identity list is exhausted and reshuffled, when `num_batches` is set
         higher than the default).
         """
-        rng = np.random.default_rng([self.seed, self._epoch])
+        # The identity permutation is seeded identically on every rank; only the
+        # slice each rank takes differs. Image choice within an identity uses a
+        # rank-specific stream, which is harmless since the identity sets are
+        # already disjoint.
+        order_rng = np.random.default_rng([self.seed, self._epoch])
+        rng = np.random.default_rng([self.seed, self._epoch, self.rank])
 
-        identity_order = rng.permutation(self._identities)
+        identity_order = order_rng.permutation(self._identities)
+        stride = self.p * self.world_size
         cursor = 0
 
         for _ in range(self._num_batches):
-            # Refill and reshuffle when fewer than P identities remain unused.
-            if cursor + self.p > len(identity_order):
-                identity_order = rng.permutation(self._identities)
+            # Refill and reshuffle when fewer than one full step remains.
+            if cursor + stride > len(identity_order):
+                identity_order = order_rng.permutation(self._identities)
                 cursor = 0
 
+            lo = cursor + self.rank * self.p
             batch: list[int] = []
-            for identity in identity_order[cursor : cursor + self.p]:
+            for identity in identity_order[lo : lo + self.p]:
                 pool = self._pools[int(identity)]
                 replace = len(pool) < self.k
                 chosen = rng.choice(pool, size=self.k, replace=replace)
                 batch.extend(int(i) for i in chosen)
 
-            cursor += self.p
+            cursor += stride
             yield batch
