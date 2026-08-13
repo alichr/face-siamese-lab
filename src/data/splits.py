@@ -28,7 +28,11 @@ _SPLIT_FILES = {
     "test": "test_identities.txt",
 }
 
-EVAL_PAIRS_FILE = "internal_eval_pairs.txt"
+PAIR_FILES = {
+    "test": "internal_eval_pairs.txt",  # final benchmark, scored once per run
+    "val": "internal_val_pairs.txt",  # per-epoch monitoring + checkpoint selection
+}
+EVAL_PAIRS_FILE = PAIR_FILES["test"]
 
 
 @dataclass(frozen=True)
@@ -112,15 +116,20 @@ def assert_identity_disjoint(splits: IdentitySplits) -> None:
 
 def load_eval_pairs(
     splits_dir: Path | str = DEFAULT_SPLITS_DIR,
+    which: str = "test",
 ) -> tuple[list[tuple[str, str]], list[int]]:
-    """Load the fixed, seeded internal evaluation pair list (plan §8.1).
+    """Load a fixed, seeded internal pair list (plan §8.1).
 
-    The list is committed so that every experiment in the matrix is scored on
-    byte-identical pairs; regenerating it per run would make E1..E8 incomparable
+    The lists are committed so that every experiment in the matrix is scored on
+    byte-identical pairs; regenerating them per run would make E1..E8 incomparable
     at the third decimal place for no reason.
 
     Args:
-        splits_dir: directory holding `internal_eval_pairs.txt`.
+        splits_dir: directory holding the pair files.
+        which: `"test"` for the final benchmark (test identities) or `"val"` for
+            per-epoch monitoring and checkpoint selection (val identities).
+            Selecting a checkpoint on the test list would bias every reported
+            number, so the two pools are kept strictly separate.
 
     Returns:
         `(pairs, labels)` where pairs are `(filename_a, filename_b)` and labels
@@ -130,7 +139,10 @@ def load_eval_pairs(
         FileNotFoundError: if the pair file is missing.
         ValueError: on a malformed line.
     """
-    path = Path(splits_dir) / EVAL_PAIRS_FILE
+    if which not in PAIR_FILES:
+        raise ValueError(f"which must be one of {sorted(PAIR_FILES)}, got {which!r}")
+
+    path = Path(splits_dir) / PAIR_FILES[which]
     if not path.exists():
         raise FileNotFoundError(
             f"eval pair list missing: {path}\nGenerate it with:\n"

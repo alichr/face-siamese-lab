@@ -25,6 +25,29 @@ import torch
 _EPS: float = 1e-12
 
 
+def _safe_sqrt(squared: torch.Tensor) -> torch.Tensor:
+    """sqrt with a finite gradient at zero.
+
+    d/dx sqrt(x) = 1/(2 sqrt(x)) diverges as x -> 0, and the self-similarity
+    diagonal sits at exactly x = 0. Those entries are masked out of every loss,
+    so their upstream gradient is exactly 0 -- and `0 * inf` is NaN, which then
+    contaminates the whole backward pass. (This is not hypothetical: it took out
+    the first contrastive gradient test.)
+
+    The fix has two halves, and both are needed:
+      * clamp the input to _EPS before sqrt, so the local derivative is large but
+        finite rather than inf;
+      * `masked_fill` the exact zeros afterwards, which restores the exact value
+        0.0 *and* blocks gradient flow through those entries entirely.
+
+    Clamping alone would leave d = 1e-6 on the diagonal instead of 0; masking
+    alone would still evaluate sqrt'(0) = inf during backward.
+    """
+    is_zero = squared <= 0
+    out = squared.clamp_min(_EPS).sqrt()
+    return out.masked_fill(is_zero, 0.0)
+
+
 def l2_normalize(z: torch.Tensor, dim: int = -1, eps: float = _EPS) -> torch.Tensor:
     """Project embeddings onto the unit hypersphere: zhat = z / ||z||_2 (poster panel 1).
 
@@ -67,7 +90,8 @@ def euclidean_distance(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
     Returns:
         (N,) distances.
     """
-    return (l2_normalize(z1) - l2_normalize(z2)).norm(p=2, dim=-1)
+    diff = l2_normalize(z1) - l2_normalize(z2)
+    return _safe_sqrt(diff.pow(2).sum(dim=-1))
 
 
 def cosine_similarity_matrix(z: torch.Tensor, other: torch.Tensor | None = None) -> torch.Tensor:
@@ -98,9 +122,9 @@ def euclidean_distance_matrix(z: torch.Tensor, other: torch.Tensor | None = None
     `cosine_similarity_matrix` -- which matters because the miners compare
     d_ap against d_an at a 1e-5 tolerance.
 
-    The clamp handles the small negative values (order -1e-7) that floating
-    point produces on the diagonal, where s should be exactly 1; sqrt of a
-    negative would yield NaN and poison every downstream loss.
+    `_safe_sqrt` handles both hazards on the diagonal, where s should be exactly
+    1: the small negative values (order -1e-7) that floating point produces
+    there, and the infinite derivative of sqrt at zero.
 
     Args:
         z: (N, D) embeddings.
@@ -110,7 +134,7 @@ def euclidean_distance_matrix(z: torch.Tensor, other: torch.Tensor | None = None
         (N, M) distances in [0, 2]; (N, N) when `other` is None.
     """
     s = cosine_similarity_matrix(z, other)
-    return (2.0 - 2.0 * s).clamp_min(0.0).sqrt()
+    return _safe_sqrt(2.0 - 2.0 * s)
 
 
 def distance_from_similarity(s: torch.Tensor) -> torch.Tensor:
@@ -119,7 +143,7 @@ def distance_from_similarity(s: torch.Tensor) -> torch.Tensor:
     Valid only for L2-normalized embeddings. Exposed so reports and figures can
     move between the poster's two boxes without recomputing embeddings.
     """
-    return (2.0 - 2.0 * s).clamp_min(0.0).sqrt()
+    return _safe_sqrt(2.0 - 2.0 * s)
 
 
 def similarity_from_distance(d: torch.Tensor) -> torch.Tensor:

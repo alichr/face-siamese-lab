@@ -1,0 +1,38 @@
+# Baseline contrastive run on the full train split (plan §7 defaults).
+# The E1 loss face-off references this row.
+
+seed: 0
+output_dir: results/baseline_contrastive
+
+data:
+  celeba_root: data/celeba
+  splits_dir: data/splits
+  augmentation: basic
+  num_workers: 8
+  debug_identities: null
+  eval_split: val         # checkpoint selection never sees test identities
+
+model:
+  backbone: resnet18
+  embedding_dim: 128
+  normalize: true
+  pretrained: false
+
+loss:
+  name: contrastive
+  margin: 1.0
+
+sampler:
+  p: 64                   # P x K = 256, plan §4
+  k: 4
+  allow_replacement: false
+
+train:
+  epochs: 30
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 5
+  grad_clip: 5.0
+  amp: bf16
+  eval_every: 1
+  batches_per_epoch: null # one pass over identities

@@ -9,8 +9,15 @@ Writes to `data/splits/`:
     train_identities.txt      8,000 CelebA identities
     val_identities.txt        1,000 identities
     test_identities.txt       the remaining ~1,177 identities
-    internal_eval_pairs.txt   6,000 positive + 6,000 negative pairs, test ids only
+    internal_eval_pairs.txt   6,000 positive + 6,000 negative pairs, TEST ids only
+    internal_val_pairs.txt    3,000 positive + 3,000 negative pairs, VAL ids only
     stats.md                  per-split image/identity counts (Phase 0 gate item 3)
+
+The two pair lists exist for different jobs and must not be confused. The val
+list drives per-epoch monitoring and best-checkpoint selection; the test list is
+the final benchmark, touched once per run at the end. Selecting a checkpoint on
+the test list would make every reported number optimistically biased -- the
+model would be chosen for the very pairs it is then scored on.
 
 Splits are by *identity*, never by image -- see `src/data/splits.py` for why.
 """
@@ -79,11 +86,11 @@ def make_identity_splits(
 
 def make_eval_pairs(
     by_identity: dict[int, list[str]],
-    test_ids: frozenset[int],
+    eval_ids: frozenset[int],
     n_per_class: int,
     seed: int,
 ) -> list[tuple[str, str, int]]:
-    """Build `n_per_class` positive and `n_per_class` negative pairs from test identities.
+    """Build `n_per_class` positive and `n_per_class` negative pairs from `eval_ids`.
 
     Positives are two distinct images of one identity; negatives are one image
     each from two distinct identities. Pairs are deduplicated, so the same
@@ -91,9 +98,9 @@ def make_eval_pairs(
     """
     rng = np.random.default_rng(seed)
 
-    eligible = sorted(i for i in test_ids if len(by_identity.get(i, [])) >= 2)
+    eligible = sorted(i for i in eval_ids if len(by_identity.get(i, [])) >= 2)
     if len(eligible) < 2:
-        raise ValueError("need >= 2 test identities with >= 2 images each")
+        raise ValueError("need >= 2 eval identities with >= 2 images each")
 
     positives: set[tuple[str, str]] = set()
     guard = 0
@@ -108,13 +115,13 @@ def make_eval_pairs(
                 f"only found {len(positives)} unique positive pairs of {n_per_class}"
             )
 
-    all_test_ids = sorted(i for i in test_ids if by_identity.get(i))
+    all_eval_ids = sorted(i for i in eval_ids if by_identity.get(i))
     negatives: set[tuple[str, str]] = set()
     guard = 0
     while len(negatives) < n_per_class:
-        i, j = rng.choice(len(all_test_ids), size=2, replace=False)
-        fa = by_identity[all_test_ids[i]]
-        fb = by_identity[all_test_ids[j]]
+        i, j = rng.choice(len(all_eval_ids), size=2, replace=False)
+        fa = by_identity[all_eval_ids[i]]
+        fb = by_identity[all_eval_ids[j]]
         a = fa[rng.integers(len(fa))]
         b = fb[rng.integers(len(fb))]
         negatives.add(tuple(sorted((a, b))))
@@ -161,7 +168,8 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, default=Path("data/splits"))
     ap.add_argument("--n-train", type=int, default=8000)
     ap.add_argument("--n-val", type=int, default=1000)
-    ap.add_argument("--n-eval-pairs", type=int, default=6000, help="per class (pos and neg)")
+    ap.add_argument("--n-eval-pairs", type=int, default=6000, help="test, per class")
+    ap.add_argument("--n-val-pairs", type=int, default=3000, help="val, per class")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -181,12 +189,21 @@ def main() -> None:
         )
     print(splits.summary())
 
-    pairs = make_eval_pairs(by_identity, splits.test, args.n_eval_pairs, args.seed)
-    (args.out_dir / "internal_eval_pairs.txt").write_text(
-        "\n".join(f"{a} {b} {y}" for a, b, y in pairs) + "\n"
-    )
-    n_pos = sum(y for *_, y in pairs)
-    print(f"internal eval pairs: {n_pos:,} positive + {len(pairs) - n_pos:,} negative")
+    # Test pairs: the final benchmark. Val pairs: per-epoch monitoring and
+    # checkpoint selection. Different identity pools, different seeds, never mixed.
+    for filename, ids, n_pairs, seed_offset, tag in (
+        ("internal_eval_pairs.txt", splits.test, args.n_eval_pairs, 0, "test"),
+        ("internal_val_pairs.txt", splits.val, args.n_val_pairs, 1, "val "),
+    ):
+        pairs = make_eval_pairs(by_identity, ids, n_pairs, args.seed + seed_offset)
+        (args.out_dir / filename).write_text(
+            "\n".join(f"{a} {b} {y}" for a, b, y in pairs) + "\n"
+        )
+        n_pos = sum(y for *_, y in pairs)
+        print(
+            f"internal {tag} pairs: {n_pos:,} positive + {len(pairs) - n_pos:,} negative "
+            f"-> {filename}"
+        )
 
     print()
     print(write_stats(args.out_dir, by_identity, splits))

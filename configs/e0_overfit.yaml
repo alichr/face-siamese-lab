@@ -1,0 +1,45 @@
+# E0 -- pipeline sanity check (plan §10, Phase 1 gate).
+#
+# Overfit 10 identities until the loss is ~0 and AUC on those same identities
+# exceeds 0.99. Overfitting is the GOAL: it is the only cheap test that rules
+# out, in one run, a whole class of wiring bugs --
+#   * labels not matching images        -> loss cannot reach 0
+#   * sampler not grouping identities   -> no positive pairs exist to pull
+#   * loss sign flipped                 -> loss rises, or AUC lands near 0
+#   * optimizer not attached to params  -> loss is flat
+# A model that cannot memorize 10 identities will never learn 8,000.
+
+seed: 0
+output_dir: results/e0_overfit
+
+data:
+  celeba_root: data/celeba
+  splits_dir: data/splits
+  augmentation: none      # augmentation fights memorization; this run wants it
+  num_workers: 8
+  debug_identities: 10    # plan §3: the first 10 CelebA train identities
+
+model:
+  backbone: resnet18
+  embedding_dim: 128
+  normalize: true
+  pretrained: false
+
+loss:
+  name: contrastive
+  margin: 1.0
+
+sampler:
+  p: 8                    # only 10 identities exist
+  k: 4
+  allow_replacement: false
+
+train:
+  epochs: 200
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 5
+  grad_clip: 5.0
+  amp: bf16
+  eval_every: 10
+  batches_per_epoch: 4    # ~200 images total; keep an "epoch" small

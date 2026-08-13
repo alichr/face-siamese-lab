@@ -92,6 +92,31 @@ def test_committed_eval_pairs_are_balanced_and_unique() -> None:
 
 
 @needs_splits
+def test_val_pairs_are_balanced_and_come_from_val_identities_only() -> None:
+    """Checkpoint selection must not see test identities (that would bias every number)."""
+    pairs, labels = load_eval_pairs(which="val")
+    assert sum(labels) == 3_000
+    assert len(labels) - sum(labels) == 3_000
+    assert len(set(pairs)) == len(pairs)
+
+
+@needs_splits
+def test_val_and_test_pair_lists_are_disjoint() -> None:
+    """No image may appear in both the selection set and the benchmark set."""
+    val_pairs, _ = load_eval_pairs(which="val")
+    test_pairs, _ = load_eval_pairs(which="test")
+    val_files = {f for pair in val_pairs for f in pair}
+    test_files = {f for pair in test_pairs for f in pair}
+    assert not (val_files & test_files)
+    assert not (set(val_pairs) & set(test_pairs))
+
+
+def test_unknown_pair_list_rejected() -> None:
+    with pytest.raises(ValueError, match="which must be one of"):
+        load_eval_pairs(which="train")
+
+
+@needs_splits
 def test_eval_pairs_never_reference_a_training_identity() -> None:
     """The internal benchmark must sit entirely on unseen identities (plan §8.1)."""
     import collections

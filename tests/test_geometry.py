@@ -89,6 +89,41 @@ def test_self_similarity_is_one_and_self_distance_is_zero() -> None:
     assert torch.isfinite(diag_d).all()
 
 
+def test_distance_matrix_gradient_is_finite_at_the_diagonal() -> None:
+    """REGRESSION: sqrt'(0) = inf on the diagonal, times a 0 upstream grad, gives NaN.
+
+    The diagonal is masked out of every loss, so its upstream gradient is exactly
+    zero -- which is precisely the case that produces `0 * inf = NaN` and silently
+    contaminates the entire backward pass. Caught by the first contrastive
+    gradient test; guarded here at the source.
+    """
+    z = l2_normalize(torch.randn(16, 8, dtype=torch.float64)).requires_grad_(True)
+    d = euclidean_distance_matrix(z)
+
+    # Mask the diagonal exactly as the losses do, then backprop.
+    off_diagonal = ~torch.eye(16, dtype=torch.bool)
+    d[off_diagonal].sum().backward()
+
+    assert z.grad is not None
+    assert torch.isfinite(z.grad).all(), "NaN/inf gradient from the masked diagonal"
+
+
+def test_coincident_embeddings_give_zero_distance_and_finite_gradient() -> None:
+    """Two identical embeddings (a duplicated image) must not blow up the backward."""
+    z = l2_normalize(torch.randn(1, 8, dtype=torch.float64)).repeat(4, 1).requires_grad_(True)
+    d = euclidean_distance_matrix(z)
+    assert torch.allclose(d, torch.zeros_like(d), atol=ATOL)
+    d.sum().backward()
+    assert torch.isfinite(z.grad).all()
+
+
+def test_rowwise_distance_gradient_is_finite_for_identical_inputs() -> None:
+    """Same hazard in the row-wise path used by the pair-scoring code."""
+    z = l2_normalize(torch.randn(4, 8, dtype=torch.float64)).requires_grad_(True)
+    euclidean_distance(z, z).sum().backward()
+    assert torch.isfinite(z.grad).all()
+
+
 def test_distance_is_monotone_decreasing_in_similarity() -> None:
     """Why thresholding s and thresholding d are the same decision (poster panel 6)."""
     z = _random_normalized(n=48)
