@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "face-siamese-lab"
+version = "0.1.0"
+description = "Contrastive vs. triplet vs. InfoNCE for face verification — a learning lab"
+requires-python = ">=3.12"
+# Runtime dependencies are pinned in requirements.txt (including the CUDA 13.0
+# torch index, which cannot be expressed here). Install with:
+#     .venv/bin/pip install -r requirements.txt
+#     .venv/bin/pip install -e .
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

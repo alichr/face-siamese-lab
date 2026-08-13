@@ -216,3 +216,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Siamese lab project rules ---
+# Raw datasets are large and re-downloadable; splits are NOT (they define the
+# experiment and must be committed — plan §3, §14.4).
+data/*
+!data/splits/
+!data/splits/**
+
+# Run outputs are regenerable; phase reports are the project's record and stay.
+results/*
+!results/phase_reports/
+!results/phase_reports/**
+
+# Checkpoints & figures anywhere
+*.pt
+*.pth
+*.ckpt

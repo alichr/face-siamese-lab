@@ -1,0 +1,36 @@
+# Siamese Network Training Lab — pinned dependencies (plan §2)
+#
+# Install into a venv on Python 3.12:
+#     python3.12 -m venv .venv
+#     .venv/bin/pip install -r requirements.txt
+#
+# torch/torchvision are CUDA 13.0 builds, required for the sm_120 Blackwell
+# cards in this box (RTX PRO 6000). The index URL below is what selects them;
+# plain PyPI wheels will not have sm_120 kernels.
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# --- core ---
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+numpy==2.4.4
+
+# --- metrics & analysis (plan §8) ---
+scikit-learn==1.9.0          # ROC-AUC, folds
+scipy==1.18.0
+pandas==3.0.5                # curves.csv, compare.py aggregation
+
+# --- visualization (plan §9) ---
+matplotlib==3.11.1
+umap-learn==0.5.12           # V4 embedding map
+
+# --- config & UX (plan §14.3) ---
+pyyaml==6.0.3
+tqdm==4.70.0
+
+# --- data fetch ---
+# torchvision's CelebA downloader shells out to gdown for its Google Drive
+# host and raises if it is absent. Not optional if you want auto-download.
+gdown==6.1.0
+
+# --- tests (plan §12) ---
+pytest==9.1.1
