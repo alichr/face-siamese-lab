@@ -30,6 +30,7 @@ from src.data.pk_sampler import PKSampler
 from src.data.splits import load_eval_pairs, load_splits
 from src.data.transforms import build_transform
 from src.engine.evaluate import evaluate_pairs
+from src.engine.report import evaluate_run
 from src.losses.contrastive import ContrastiveLoss
 from src.losses.infonce import InfoNCELoss
 from src.losses.triplet import TripletLoss
@@ -63,6 +64,7 @@ DEFAULTS: dict[str, Any] = {
         "amp": "bf16",
         "eval_every": 1,
         "batches_per_epoch": None,
+        "full_eval": True,
     },
 }
 
@@ -326,7 +328,21 @@ def train(config_path: Path, overrides: dict | None = None) -> dict:
         out_dir / "ckpts" / "last.pt",
     )
 
+    # Full evaluation runs on the BEST-by-val-AUC checkpoint, not the last one.
+    # The test pair list and LFW are touched exactly once, here, after training
+    # and checkpoint selection are both finished.
+    best_path = out_dir / "ckpts" / "best.pt"
+    if best_path.exists() and train_cfg["full_eval"]:
+        model.load_state_dict(torch.load(best_path, weights_only=False)["model"])
+
+    full_metrics = (
+        evaluate_run(model, cfg, out_dir, device, amp_dtype=amp_dtype)
+        if train_cfg["full_eval"]
+        else {}
+    )
+
     metrics = {
+        **full_metrics,
         "final": last_eval,
         "best_val_auc": best_auc,
         "best_epoch": best_epoch,
