@@ -57,7 +57,15 @@ data/celeba/
 └── list_landmarks_align_celeba.txt
 ```
 
-**LFW** (evaluation only, never training) is fetched via `torchvision.datasets.LFWPairs` — 6,000 pairs, standard 10-fold protocol.
+**LFW** (evaluation only, never training) — 6,000 pairs, standard 10-fold protocol.
+
+> ⚠️ `torchvision.datasets.LFWPairs` **no longer auto-downloads** (upstream raises "no longer available"), and the canonical host `vis-www.cs.umass.edu` does not resolve. Fetch the identical funneled dataset plus the official `pairs.txt` from scikit-learn's figshare mirror instead:
+>
+> ```python
+> from sklearn.datasets import fetch_lfw_pairs
+> fetch_lfw_pairs(subset="10_folds", funneled=True, color=True,
+>                 resize=1.0, data_home="data/lfw_sklearn")
+> ```
 
 ### Splits
 
@@ -93,13 +101,18 @@ Work proceeds one phase at a time with a hard stop at each gate. Phase reports l
 
 | Phase | Title | Gate | Status |
 |---|---|---|---|
-| 0 | Environment & data | Tests green; identity-disjoint splits committed | 🔨 in progress |
-| 1 | Minimal pipeline | E0 overfit passes; epoch wall-clock measured | ⬜ |
-| 2 | All losses & miners | Every unit-test vector passes exactly | ⬜ |
-| 3 | Eval + viz suites | One baseline run yields a complete report + all figures | ⬜ |
-| 4 | **DDP + global negatives** | Single-GPU vs 3-GPU loss **and gradients** match | ⬜ |
-| 5 | Run the experiment matrix | All E1–E8 results + cross-experiment comparison | ⬜ |
-| 6 | Findings | Every poster claim answered with a figure and a number | ⬜ |
+| 0 | Environment & data | Tests green; identity-disjoint splits committed | ✅ |
+| 1 | Minimal pipeline | E0 overfit passes (val AUC 0.9927); 12.4 s/epoch | ✅ |
+| 2 | All losses & miners | Every unit-test vector passes exactly | ✅ |
+| 3 | Eval + viz suites | Baseline LFW 0.9023 ± 0.0165, all of V1–V6 | ✅ |
+| 4 | **DDP + global negatives** | Loss 4.8e-07, **gradients** 4.4e-05, control fails by 2.0e-02 | ✅ |
+| 5 | Run the experiment matrix | 35 runs, 0 failures, 87 min | ✅ |
+| 6 | Findings | [`FINDINGS.md`](FINDINGS.md) | ✅ |
+
+**Read [`FINDINGS.md`](FINDINGS.md) first** — it answers every poster claim with a figure
+and a number, including the four results that contradicted the plan's predictions.
+Then [`notebooks/siamese_lab_tour.ipynb`](notebooks/siamese_lab_tour.ipynb) to play with
+the code interactively.
 
 **Phase 4 is the critical gate.** Cross-GPU negative gathering fails *silently*: with a detached all-gather, training still runs and loss still falls, but gradients from other ranks' anchors never reach the local embeddings — you get small-batch InfoNCE while believing you have large-batch InfoNCE, which would invalidate experiment E5. That gate checks **gradients**, not just loss.
 
@@ -110,9 +123,13 @@ Work proceeds one phase at a time with a hard stop at each gate. Phase reports l
 Once Phase 1 lands, every run is YAML-driven and the resolved config is copied next to its outputs:
 
 ```bash
-.venv/bin/python -m src.engine.train --config configs/e0_overfit.yaml          # single GPU
-.venv/bin/torchrun --nproc_per_node=3 -m src.engine.train --config configs/e5_global.yaml   # DDP (E5)
-.venv/bin/pytest tests/                                                        # unit vectors, plan §12
+.venv/bin/python -m src.engine.train --config configs/e1_infonce.yaml           # single GPU
+.venv/bin/torchrun --nproc_per_node=3 -m src.engine.train \
+    --config configs/e5_infonce_global768.yaml                                 # DDP (E5)
+.venv/bin/python scripts/sweep.py --all                                        # whole matrix, 3 GPUs
+.venv/bin/python scripts/compare.py                                            # master table + V2/V6/V7
+.venv/bin/python -m pytest tests/                                              # 189 tests
+.venv/bin/jupyter lab notebooks/siamese_lab_tour.ipynb                         # interactive tour
 ```
 
 `scripts/sweep.py` keeps all 3 GPUs busy by assigning configs round-robin; `scripts/compare.py` aggregates every `metrics.json` into the cross-experiment table and figures.

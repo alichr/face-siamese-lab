@@ -213,7 +213,10 @@ def main() -> None:
     points = {
         row["run"]: (row["alignment"], row["uniformity"])
         for _, row in frame.iterrows()
-        if pd.notna(row["alignment"]) and row["experiment"] in ("e1", "e6")
+        # E1 (the three losses) + E5 (the negatives sweep). E6 is excluded because
+        # its two runs are the same experiment twice (see phase_5.md §d1) and their
+        # coincident points make the labels unreadable.
+        if pd.notna(row["alignment"]) and row["experiment"] in ("e1", "e5")
     }
     if points:
         plot_align_uniform(points, OUT, name="v6_align_uniform",
